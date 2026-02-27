@@ -13,6 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# pyright: reportMissingImports=false
+# pyright: reportInvalidTypeForm=false
+# pyright: reportArgumentType=false
+# pyright: reportAttributeAccessIssue=false
+# pyright: reportCallIssue=false
+# pyright: reportOperatorIssue=false
+# pyright: reportOptionalMemberAccess=false
+
 import warp as wp
 
 from ...geometry import ParticleFlags
@@ -244,8 +252,11 @@ def eval_particle_body_contact(
     # contact elastic
     fn = n * c * ke
 
-    # contact damping
-    fd = n * wp.min(vn, 0.0) * kd
+    # contact damping (cap to avoid non-physical impulses on speed spikes)
+    fd_s = wp.min(vn, 0.0) * kd
+    alpha = 20.0
+    fd_s = wp.max(fd_s, -alpha * wp.abs(c) * ke)
+    fd = n * fd_s
 
     # viscous friction
     # ft = vt*kf
