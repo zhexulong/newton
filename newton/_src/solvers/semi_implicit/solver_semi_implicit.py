@@ -44,7 +44,7 @@ from .kernels_particle import (
 @wp.kernel
 def _accum_particle_forces(dst: wp.array(dtype=wp.vec3), src: wp.array(dtype=wp.vec3)):
     i = wp.tid()
-    wp.atomic_add(dst, i, src[i])
+    dst[i] = dst[i] + src[i]
 
 
 @wp.kernel
@@ -53,7 +53,7 @@ def _accum_body_wrenches(
     src: wp.array(dtype=wp.spatial_vector),
 ):
     i = wp.tid()
-    wp.atomic_add(dst, i, src[i])
+    dst[i] = dst[i] + src[i]
 
 
 class SolverSemiImplicit(SolverBase):
@@ -106,6 +106,16 @@ class SolverSemiImplicit(SolverBase):
         self.joint_attach_ke = joint_attach_ke
         self.joint_attach_kd = joint_attach_kd
         self.enable_tri_contact = enable_tri_contact
+
+        self.debug_force_breakdown_enabled = False
+        self.debug_force_breakdown_body_idx = -1
+        self.debug_force_breakdown_floor_body_idx = -1
+        self.debug_force_breakdown_records = []
+        self._debug_force_breakdown_counter = 0
+        self.debug_particle_left_lo = -1
+        self.debug_particle_left_hi = -1
+        self.debug_particle_right_lo = -1
+        self.debug_particle_right_hi = -1
 
     @override
     def step(
@@ -183,40 +193,197 @@ class SolverSemiImplicit(SolverBase):
                 )
 
             # damped springs
-            eval_spring_forces(model, state_in, particle_f)
+            if particle_f is not None:
+                eval_spring_forces(model, state_in, particle_f)
 
             # triangle elastic and lift/drag forces
-            eval_triangle_forces(model, state_in, control, particle_f)
+            if particle_f is not None:
+                eval_triangle_forces(model, state_in, control, particle_f)
 
             # triangle bending
-            eval_bending_forces(model, state_in, particle_f)
+            if particle_f is not None:
+                eval_bending_forces(model, state_in, particle_f)
 
             # tetrahedral FEM
-            eval_tetrahedra_forces(model, state_in, control, particle_f)
+            if particle_f is not None:
+                eval_tetrahedra_forces(model, state_in, control, particle_f)
 
             # body joints
-            eval_body_joint_forces(model, state_in, control, body_f_work, self.joint_attach_ke, self.joint_attach_kd)
+            if body_f_work is not None:
+                eval_body_joint_forces(
+                    model,
+                    state_in,
+                    control,
+                    body_f_work,
+                    self.joint_attach_ke,
+                    self.joint_attach_kd,
+                )
 
             # muscles
             if False:
                 eval_muscle_forces(model, state_in, control, body_f)
 
             # particle-particle interactions
-            eval_particle_contact_forces(model, state_in, particle_f)
+            if particle_f is not None:
+                eval_particle_contact_forces(model, state_in, particle_f)
 
             # triangle/triangle contacts
-            if self.enable_tri_contact:
+            if self.enable_tri_contact and particle_f is not None:
                 eval_triangle_contact_forces(model, state_in, particle_f)
 
             # body contacts
-            eval_body_contact_forces(
-                model, state_in, contacts, friction_smoothing=self.friction_smoothing, body_f_out=body_f_work
-            )
+            if contacts is not None and body_f_work is not None:
+                eval_body_contact_forces(
+                    model,
+                    state_in,
+                    contacts,
+                    friction_smoothing=self.friction_smoothing,
+                    body_f_out=body_f_work,
+                )
 
             # particle shape contact
-            eval_particle_body_contact_forces(
-                model, state_in, contacts, particle_f, body_f_work, body_f_in_world_frame=False
-            )
+
+            debug_enabled = bool(getattr(self, "debug_force_breakdown_enabled", False))
+            debug_body_idx = int(getattr(self, "debug_force_breakdown_body_idx", -1) or -1)
+            debug_floor_body_idx = int(getattr(self, "debug_force_breakdown_floor_body_idx", -1) or -1)
+            debug_wrench_before = None
+            debug_wrench_floor_before = None
+            did_particle_body_contact = False
+            if contacts is not None and particle_f is not None and body_f_work is not None:
+                if debug_enabled and debug_body_idx >= 0 and debug_body_idx < int(state_in.body_count):
+                    try:
+                        debug_wrench_before = body_f_work.numpy()[debug_body_idx].tolist()
+                    except Exception:
+                        debug_wrench_before = None
+                    if debug_floor_body_idx >= 0 and debug_floor_body_idx < int(state_in.body_count):
+                        try:
+                            debug_wrench_floor_before = body_f_work.numpy()[debug_floor_body_idx].tolist()
+                        except Exception:
+                            debug_wrench_floor_before = None
+
+                eval_particle_body_contact_forces(
+                    model,
+                    state_in,
+                    contacts,
+                    particle_f,
+                    body_f_work,
+                    body_f_in_world_frame=False,
+                )
+                did_particle_body_contact = True
+
+            if debug_enabled:
+                try:
+                    records = getattr(self, "debug_force_breakdown_records", None)
+                    if not isinstance(records, list):
+                        records = []
+                        self.debug_force_breakdown_records = records
+
+                    ac = 0
+                    ac_left = 0
+                    ac_right = 0
+                    normal_stats = None
+                    if contacts is not None and getattr(contacts, "soft_contact_count", None) is not None:
+                        try:
+                            ac = int(contacts.soft_contact_count.numpy()[0])
+                        except Exception:
+                            ac = 0
+
+                        if ac > 0 and getattr(contacts, "soft_contact_normal", None) is not None:
+                            try:
+                                n = contacts.soft_contact_normal.numpy()[:ac]
+                                dot = n[:, 1].astype(float)
+                                dot_min = float(dot.min())
+                                dot_max = float(dot.max())
+                                dot_mean = float(dot.mean())
+                                dot_frac = float((dot > 0.0).mean())
+                                normal_stats = {
+                                    "dot_up_min": dot_min,
+                                    "dot_up_max": dot_max,
+                                    "dot_up_mean": dot_mean,
+                                    "dot_up_frac_pos": dot_frac,
+                                }
+                            except Exception:
+                                normal_stats = None
+
+                        lo = int(getattr(self, "debug_particle_left_lo", -1) or -1)
+                        hi = int(getattr(self, "debug_particle_left_hi", -1) or -1)
+                        lo2 = int(getattr(self, "debug_particle_right_lo", -1) or -1)
+                        hi2 = int(getattr(self, "debug_particle_right_hi", -1) or -1)
+                        if (
+                            ac > 0
+                            and getattr(contacts, "soft_contact_particle", None) is not None
+                            and ((lo >= 0 and hi > lo) or (lo2 >= 0 and hi2 > lo2))
+                        ):
+                            try:
+                                pids = contacts.soft_contact_particle.numpy()[:ac].astype(int)
+                                if lo >= 0 and hi > lo:
+                                    ac_left = int(((pids >= lo) & (pids < hi)).sum())
+                                if lo2 >= 0 and hi2 > lo2:
+                                    ac_right = int(((pids >= lo2) & (pids < hi2)).sum())
+                            except Exception:
+                                ac_left = 0
+                                ac_right = 0
+
+                    wrench_delta = None
+                    wrench_floor_delta = None
+                    if (
+                        did_particle_body_contact
+                        and body_f_work is not None
+                        and debug_body_idx >= 0
+                        and debug_body_idx < int(state_in.body_count)
+                    ):
+                        try:
+                            after = body_f_work.numpy()[debug_body_idx].tolist()
+                            if (
+                                isinstance(debug_wrench_before, list)
+                                and isinstance(after, list)
+                                and len(after) == len(debug_wrench_before)
+                            ):
+                                wrench_delta = [
+                                    float(after[i]) - float(debug_wrench_before[i]) for i in range(len(after))
+                                ]
+                            else:
+                                wrench_delta = after
+                        except Exception:
+                            wrench_delta = None
+
+                        if debug_floor_body_idx >= 0 and debug_floor_body_idx < int(state_in.body_count):
+                            try:
+                                after_floor = body_f_work.numpy()[debug_floor_body_idx].tolist()
+                                if (
+                                    isinstance(debug_wrench_floor_before, list)
+                                    and isinstance(after_floor, list)
+                                    and len(after_floor) == len(debug_wrench_floor_before)
+                                ):
+                                    wrench_floor_delta = [
+                                        float(after_floor[i]) - float(debug_wrench_floor_before[i])
+                                        for i in range(len(after_floor))
+                                    ]
+                                else:
+                                    wrench_floor_delta = after_floor
+                            except Exception:
+                                wrench_floor_delta = None
+
+                    substep_global = int(getattr(self, "_debug_force_breakdown_counter", 0) or 0)
+                    self._debug_force_breakdown_counter = int(substep_global) + 1
+
+                    row = {
+                        "substep_global": int(substep_global),
+                        "particle_body_contact_stats": {
+                            "total": {
+                                "active_count": int(ac),
+                                **({"normal_stats": normal_stats} if isinstance(normal_stats, dict) else {}),
+                            },
+                            "left": {"active_count": int(ac_left)},
+                            "right": {"active_count": int(ac_right)},
+                        },
+                        "particle_body_contact_wrench": wrench_delta,
+                    }
+                    if wrench_floor_delta is not None:
+                        row["particle_body_contact_wrench_floor"] = wrench_floor_delta
+                    records.append(row)
+                except Exception:
+                    pass
 
             self.integrate_particles(model, state_in, state_out, dt)
 
