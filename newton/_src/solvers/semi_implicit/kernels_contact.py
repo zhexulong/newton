@@ -221,6 +221,9 @@ def eval_particle_body_contact(
     r = bx - wp.transform_point(X_wb, X_com)
 
     n = contact_normal[tid]
+    n2 = wp.dot(n, n)
+    if n2 < 1.0e-24:
+        return
     c = wp.dot(n, px - bx) - particle_radius[particle_index]
 
     if c > particle_ka:
@@ -271,7 +274,11 @@ def eval_particle_body_contact(
     # ft = wp.vec3(vx, 0.0, vz)
 
     # Coulomb friction (smooth, but gradients are numerically unstable around |vt| = 0)
-    ft = wp.normalize(vt) * wp.min(kf * wp.length(vt), abs(mu * c * ke))
+    vt_len = wp.length(vt)
+    ft_mag = wp.min(kf * vt_len, wp.abs(mu * c * ke))
+    ft = wp.vec3(0.0, 0.0, 0.0)
+    if vt_len > 1.0e-12:
+        ft = (vt / vt_len) * ft_mag
 
     f_total = fn + (fd + ft)
 
@@ -333,8 +340,10 @@ def eval_triangles_body_contact(
 
     # moment arm
     r = pos - x0  # basically just c_point in the new coordinates
-    rhat = wp.normalize(r)
-    pos = pos + rhat * c_dist  # add on 'thickness' of shape, e.g.: radius of sphere/capsule
+    r2 = wp.dot(r, r)
+    if r2 > 1.0e-24:
+        rhat = r / wp.sqrt(r2)
+        pos = pos + rhat * c_dist  # add on 'thickness' of shape, e.g.: radius of sphere/capsule
 
     # contact point velocity
     dpdt = v0 + wp.cross(w0, r)  # this is body velocity cross offset, so it's the velocity of the contact point.
@@ -358,7 +367,9 @@ def eval_triangles_body_contact(
 
     diff = pos - closest  # vector from tri to point
     dist = wp.dot(diff, diff)  # squared distance
-    n = wp.normalize(diff)  # points into the object
+    if dist < 1.0e-24:
+        return
+    n = diff / wp.sqrt(dist)  # points into the object
     c = wp.min(dist - 0.05, 0.0)  # 0 unless within 0.05 of surface
     # c = wp.leaky_min(wp.dot(n, x0)-0.01, 0.0, 0.0)
     # fn = n * c * 1e6    # points towards cloth (both n and c are negative)
