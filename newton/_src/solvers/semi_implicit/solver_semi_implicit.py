@@ -13,6 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# pyright: reportMissingImports=false
+# pyright: reportInvalidTypeForm=false
+
 import warp as wp
 
 from ...core.types import override
@@ -36,6 +39,21 @@ from .kernels_particle import (
     eval_tetrahedra_forces,
     eval_triangle_forces,
 )
+
+
+@wp.kernel
+def _accum_particle_forces(dst: wp.array(dtype=wp.vec3), src: wp.array(dtype=wp.vec3)):
+    i = wp.tid()
+    wp.atomic_add(dst, i, src[i])
+
+
+@wp.kernel
+def _accum_body_wrenches(
+    dst: wp.array(dtype=wp.spatial_vector),
+    src: wp.array(dtype=wp.spatial_vector),
+):
+    i = wp.tid()
+    wp.atomic_add(dst, i, src[i])
 
 
 class SolverSemiImplicit(SolverBase):
@@ -135,6 +153,34 @@ class SolverSemiImplicit(SolverBase):
             if body_f is not None and model.joint_count and control.joint_f is not None:
                 # Avoid accumulating joint_f into the persistent state body_f buffer.
                 body_f_work = wp.clone(body_f)
+
+            particle_f_ext = getattr(model, "particle_f_ext", None)
+            if particle_f is not None and particle_f_ext is not None:
+                if getattr(particle_f_ext, "shape", None) != particle_f.shape:
+                    raise ValueError(
+                        "model.particle_f_ext must match state_in.particle_f shape "
+                        f"(got {getattr(particle_f_ext, 'shape', None)} vs {particle_f.shape})"
+                    )
+                wp.launch(
+                    kernel=_accum_particle_forces,
+                    dim=state_in.particle_count,
+                    inputs=[particle_f, particle_f_ext],
+                    device=particle_f.device,
+                )
+
+            body_f_ext = getattr(model, "body_f_ext", None)
+            if body_f_work is not None and body_f_ext is not None:
+                if getattr(body_f_ext, "shape", None) != body_f_work.shape:
+                    raise ValueError(
+                        "model.body_f_ext must match state_in.body_f shape "
+                        f"(got {getattr(body_f_ext, 'shape', None)} vs {body_f_work.shape})"
+                    )
+                wp.launch(
+                    kernel=_accum_body_wrenches,
+                    dim=state_in.body_count,
+                    inputs=[body_f_work, body_f_ext],
+                    device=body_f_work.device,
+                )
 
             # damped springs
             eval_spring_forces(model, state_in, particle_f)
